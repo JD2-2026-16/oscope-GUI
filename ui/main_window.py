@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from PyQt6.QtCore import QPointF, Qt, QTimer
-from PyQt6.QtGui import QColor, QPainter, QPaintEvent, QPen
+from PyQt6.QtGui import QColor, QPainter, QPaintEvent, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QComboBox,
     QFrame,
@@ -56,6 +56,8 @@ class WaveformWidget(QWidget):
         self.setMinimumHeight(360)
         self.frame_data: ScopeFrame | None = None
         self.settings = ScopeSettings()
+        self._bg_cache: QPixmap | None = None
+        self._bg_cache_size: tuple[int, int] | None = None
 
     def set_frame(self, frame: ScopeFrame) -> None:
         """Push in latest frame and request repaint."""
@@ -70,11 +72,11 @@ class WaveformWidget(QWidget):
     def paintEvent(self, event: QPaintEvent) -> None:  # noqa: N802
         del event
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        # Keep redraw latency low; anti-aliasing is expensive at high refresh rates.
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
 
         rect = self.rect()
-        painter.fillRect(rect, QColor("#10131A"))
-        self._draw_grid(painter, rect.width(), rect.height())
+        self._draw_cached_background(painter, rect.width(), rect.height())
 
         # Draw trigger level even before data exists so control feedback is visible.
         self._draw_trigger_line(painter, rect.width(), rect.height())
@@ -129,6 +131,18 @@ class WaveformWidget(QWidget):
         for y in range(0, height, y_step):
             painter.drawLine(0, y, width, y)
 
+    def _draw_cached_background(self, painter: QPainter, width: int, height: int) -> None:
+        size = (width, height)
+        if self._bg_cache is None or self._bg_cache_size != size:
+            bg = QPixmap(width, height)
+            bg.fill(QColor("#10131A"))
+            bg_painter = QPainter(bg)
+            self._draw_grid(bg_painter, width, height)
+            bg_painter.end()
+            self._bg_cache = bg
+            self._bg_cache_size = size
+        painter.drawPixmap(0, 0, self._bg_cache)
+
     def _draw_trigger_line(self, painter: QPainter, width: int, height: int) -> None:
         # Trigger level uses CH1 vertical scale for now (common in simple scopes).
         v_div = self.settings.ch1_v_div
@@ -163,6 +177,15 @@ class WaveformWidget(QWidget):
         window = samples[window_start : window_start + visible_count]
         if len(window) < 2:
             return
+
+        # Draw at most ~2 points per screen pixel to keep painting cost bounded.
+        max_points = max(width * 2, 256)
+        if len(window) > max_points:
+            step = (len(window) + max_points - 1) // max_points
+            downsampled = window[::step]
+            if downsampled[-1] != window[-1]:
+                downsampled.append(window[-1])
+            window = downsampled
 
         volts_full_scale = max(v_div * 4.0, 1e-6)  # +/-4 divisions on vertical.
         x_scale = width / max(len(window) - 1, 1)
@@ -222,7 +245,7 @@ class MainWindow(QMainWindow):
 
         self.source: ScopeSource | None = None
         self.acq_timer = QTimer(self)
-        self.acq_timer.setInterval(33)  # ~30 FPS UI refresh.
+        self.acq_timer.setInterval(10)  # Faster polling keeps USB backlog lower.
         self.acq_timer.timeout.connect(self._poll_next_frame)
 
         self._build_layout()
@@ -241,7 +264,7 @@ class MainWindow(QMainWindow):
         top_bar.addWidget(QLabel("Source:"))
 
         self.device_combo = QComboBox()
-        self.device_combo.addItems(["Mock Device", "USB Scope (stub)"])
+        self.device_combo.addItems(["Mock Device", "USB Scope"])
         self.device_combo.setMinimumWidth(220)
         top_bar.addWidget(self.device_combo)
 
@@ -269,17 +292,11 @@ class MainWindow(QMainWindow):
         middle.setSpacing(10)
         layout.addLayout(middle, stretch=1)
 
-        control_panel = self._build_control_panel()
-        control_panel.setFixedWidth(310)
-        middle.addWidget(control_panel)
-
         self.waveform = WaveformWidget()
         self.waveform.set_settings(self.settings)
         middle.addWidget(self.waveform, stretch=1)
 
-        footer = QLabel(
-            "Frame-based UI is active. Mock source emulates two simultaneous channels; USB backend is a stub."
-        )
+        footer = QLabel("Viewer mode: waveform display follows front-panel settings from scope firmware.")
         layout.addWidget(footer)
 
     def _build_control_panel(self) -> QFrame:
@@ -415,30 +432,30 @@ class MainWindow(QMainWindow):
             self.status_label.setText(str(exc))
             return
         except Exception as exc:
+            # USB startup/transport hiccups are expected; keep running and retry.
+            msg = str(exc)
+            if ("Waiting for first scope frame" in msg) or ("No valid scope frames received" in msg):
+                self.status_label.setText(msg)
+                return
             self._stop_run()
             self.status_label.setText(f"Acq error: {exc}")
             return
 
+        self._apply_frame_settings(frame)
         self.waveform.set_frame(frame)
         self.status_label.setText(f"Running: {frame.sample_count} samples/ch @ {frame.sample_rate_hz} Hz")
 
-    def _set_channel_enabled(self, channel: int, enabled: bool) -> None:
-        if channel == 1:
-            self.settings.ch1_enabled = enabled
-            self.ch1_btn.setText("CH1 On" if enabled else "CH1 Off")
-        else:
-            self.settings.ch2_enabled = enabled
-            self.ch2_btn.setText("CH2 On" if enabled else "CH2 Off")
-        self.waveform.set_settings(self.settings)
-
-    def _sync_settings_from_controls(self) -> None:
-        # Parse control values into normalized SI units.
-        self.settings.ch1_v_div = float(self.ch1_vdiv_combo.currentText())
-        self.settings.ch2_v_div = float(self.ch2_vdiv_combo.currentText())
-        self.settings.s_div = self._parse_sdiv_text(self.sdiv_combo.currentText())
-        self.settings.trigger_source = self.trigger_src_combo.currentText()
-        self.settings.trigger_level_v = self.trigger_slider.value() / 100.0
-        self.trigger_value_label.setText(f"{self.settings.trigger_level_v:.2f}")
+    def _apply_frame_settings(self, frame: ScopeFrame) -> None:
+        if frame.ch1_enabled is not None:
+            self.settings.ch1_enabled = frame.ch1_enabled
+        if frame.ch2_enabled is not None:
+            self.settings.ch2_enabled = frame.ch2_enabled
+        if frame.ch1_v_div is not None:
+            self.settings.ch1_v_div = frame.ch1_v_div
+        if frame.ch2_v_div is not None:
+            self.settings.ch2_v_div = frame.ch2_v_div
+        if frame.s_div is not None:
+            self.settings.s_div = frame.s_div
         self.waveform.set_settings(self.settings)
 
     @staticmethod
