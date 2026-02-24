@@ -29,6 +29,9 @@ class UsbScope:
         self._port_name: str | None = None
         self._last_frame: ScopeFrame | None = None
         self._connected_at: float = 0.0
+        # Approximate raw ADC sample rate before decimation.
+        # Tune this constant if horizontal scaling looks off on hardware.
+        self._base_sample_rate_hz: int = 500_000
 
         # TODO (firmware integration):
         # Store VID/PID, endpoint numbers, timeout settings, etc.
@@ -167,7 +170,7 @@ class UsbScope:
         return self._last_frame
 
     def _decode_frame(self, header: bytes, payload: bytes) -> ScopeFrame:
-        _, header_size, sample_count, trigger, ch_config, time_config, _ = (
+        _, header_size, sample_count, trigger, ch_config, time_config, reserved = (
             struct.unpack(protocol.FRAME_HDR_FMT, header)
         )
         if header_size != protocol.FRAME_HEADER_BYTES:
@@ -180,7 +183,21 @@ class UsbScope:
             s_div = protocol.S_DIV_OPTIONS_S[sdiv_idx]
         else:
             s_div = protocol.S_DIV_OPTIONS_S[-1]
-        sample_rate_hz = max(1, int(round(sample_count / max(10.0 * s_div, 1e-9))))
+        decimation_shift = (
+            time_config & protocol.TIME_CONFIG_DEC_MASK
+        ) >> protocol.TIME_CONFIG_DEC_POS
+        decimation_shift = max(0, min(int(decimation_shift), 7))
+        sample_rate_hz = max(1, int(self._base_sample_rate_hz // (1 << decimation_shift)))
+        # Firmware trigger byte is 8-bit, where one LSB equals 16 ADC codes.
+        trigger_adc_code = min(int(trigger) * 16, 4095)
+        trigger_level_v = self._adc_to_volts(trigger_adc_code)
+        trigger_found = (reserved & protocol.FRAME_META_TRIGGER_FOUND_BIT) != 0
+        trigger_index_raw = int(reserved & protocol.FRAME_META_TRIGGER_INDEX_MASK)
+        trigger_index = (
+            trigger_index_raw
+            if (trigger_found and 0 <= trigger_index_raw < int(sample_count))
+            else None
+        )
 
         ch1_enabled = (ch_config & protocol.CH_CONFIG_CH1_EN) != 0
         ch2_enabled = (ch_config & protocol.CH_CONFIG_CH2_EN) != 0
@@ -222,19 +239,18 @@ class UsbScope:
                 ch1[i] = self._adc_to_volts(raw1)
                 ch2[i] = self._adc_to_volts(raw2)
 
-        trig_index = int(trigger)
-        if trig_index >= sample_count:
-            trig_index = sample_count // 2
         return ScopeFrame(
             sample_rate_hz=sample_rate_hz,
             ch1=ch1,
             ch2=ch2,
-            trigger_index=trig_index,
+            trigger_index=trigger_index,
+            trigger_found=trigger_found,
             ch1_enabled=ch1_enabled,
             ch2_enabled=ch2_enabled,
             ch1_v_div=ch1_v_div,
             ch2_v_div=ch2_v_div,
             s_div=s_div,
+            trigger_level_v=trigger_level_v,
         )
 
     def _try_extract_one_packet(self) -> tuple[bytes, bytes] | None:

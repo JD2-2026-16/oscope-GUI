@@ -18,11 +18,13 @@ class ScopeFrame:
     ch1: list[float]
     ch2: list[float]
     trigger_index: int | None = None
+    trigger_found: bool | None = None
     ch1_enabled: bool | None = None
     ch2_enabled: bool | None = None
     ch1_v_div: float | None = None
     ch2_v_div: float | None = None
     s_div: float | None = None
+    trigger_level_v: float | None = None
 
     @property
     def sample_count(self) -> int:
