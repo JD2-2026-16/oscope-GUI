@@ -19,6 +19,7 @@ class ScopeFrame:
     ch2: list[float]
     trigger_index: int | None = None
     trigger_found: bool | None = None
+    trigger_source: str | None = None
     ch1_enabled: bool | None = None
     ch2_enabled: bool | None = None
     ch1_v_div: float | None = None

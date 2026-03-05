@@ -29,10 +29,6 @@ class UsbScope:
         self._port_name: str | None = None
         self._last_frame: ScopeFrame | None = None
         self._connected_at: float = 0.0
-        # Approximate raw ADC sample rate before decimation.
-        # Tune this constant if horizontal scaling looks off on hardware.
-        self._base_sample_rate_hz: int = 500_000
-
         # TODO (firmware integration):
         # Store VID/PID, endpoint numbers, timeout settings, etc.
         # Example fields once you define protocol:
@@ -183,15 +179,24 @@ class UsbScope:
             s_div = protocol.S_DIV_OPTIONS_S[sdiv_idx]
         else:
             s_div = protocol.S_DIV_OPTIONS_S[-1]
-        decimation_shift = (
-            time_config & protocol.TIME_CONFIG_DEC_MASK
-        ) >> protocol.TIME_CONFIG_DEC_POS
-        decimation_shift = max(0, min(int(decimation_shift), 7))
-        sample_rate_hz = max(1, int(self._base_sample_rate_hz // (1 << decimation_shift)))
+        span_raw = int(
+            (reserved & protocol.FRAME_META_SPAN_MASK) >> protocol.FRAME_META_SPAN_POS
+        )
+        if span_raw > 0:
+            sample_rate_hz = max(1, int(round(span_raw / max(10.0 * s_div, 1e-9))))
+        else:
+            sample_rate_hz = max(
+                1, int(round(sample_count / max(10.0 * s_div, 1e-9)))
+            )
         # Firmware trigger byte is 8-bit, where one LSB equals 16 ADC codes.
         trigger_adc_code = min(int(trigger) * 16, 4095)
         trigger_level_v = self._adc_to_volts(trigger_adc_code)
         trigger_found = (reserved & protocol.FRAME_META_TRIGGER_FOUND_BIT) != 0
+        trigger_source = (
+            "CH2"
+            if (reserved & protocol.FRAME_META_TRIGGER_SRC_CH2_BIT) != 0
+            else "CH1"
+        )
         trigger_index_raw = int(reserved & protocol.FRAME_META_TRIGGER_INDEX_MASK)
         trigger_index = (
             trigger_index_raw
@@ -245,6 +250,7 @@ class UsbScope:
             ch2=ch2,
             trigger_index=trigger_index,
             trigger_found=trigger_found,
+            trigger_source=trigger_source,
             ch1_enabled=ch1_enabled,
             ch2_enabled=ch2_enabled,
             ch1_v_div=ch1_v_div,

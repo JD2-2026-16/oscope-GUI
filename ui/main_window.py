@@ -98,8 +98,13 @@ class WaveformWidget(QWidget):
             self._trigger_found = bool(self.frame_data.trigger_found)
         else:
             self._trigger_found = False
+        trigger_samples = (
+            self.frame_data.ch2
+            if self.settings.trigger_source == "CH2"
+            else self.frame_data.ch1
+        )
         shared_window_start = self._choose_window_start(
-            self.frame_data.ch1, visible_count, "CH1"
+            trigger_samples, visible_count, self.settings.trigger_source
         )
 
         if self.settings.ch1_enabled:
@@ -109,7 +114,7 @@ class WaveformWidget(QWidget):
                 width=rect.width(),
                 height=rect.height(),
                 v_div=self.settings.ch1_v_div,
-                color=QColor("#4EE39B"),
+                color=QColor("#FFD84D"),
                 source_name="CH1",
                 forced_window_start=shared_window_start,
             )
@@ -133,7 +138,7 @@ class WaveformWidget(QWidget):
                 f"CH1 {self.settings.ch1_v_div:.2f} V/div   "
                 f"CH2 {self.settings.ch2_v_div:.2f} V/div   "
                 f"{self._format_time_div(self.settings.s_div)}   "
-                f"Trig {self.settings.trigger_level_v:+.2f} V   "
+                f"Trig {self.settings.trigger_source} {self.settings.trigger_level_v:+.2f} V   "
                 f"Trigger: {'FOUND' if self._trigger_found else 'NOT FOUND'}"
             ),
         )
@@ -167,14 +172,21 @@ class WaveformWidget(QWidget):
         painter.drawPixmap(0, 0, self._bg_cache)
 
     def _draw_trigger_line(self, painter: QPainter, width: int, height: int) -> None:
-        # Trigger level uses CH1 vertical scale for now (common in simple scopes).
-        v_div = self.settings.ch1_v_div
+        # Scale trigger line against the active trigger source channel.
+        v_div = (
+            self.settings.ch2_v_div
+            if self.settings.trigger_source == "CH2"
+            else self.settings.ch1_v_div
+        )
         volts_full_scale = max(v_div * 4.0, 1e-6)  # +/-4 divisions around center.
         y = height / 2.0 - (self.settings.trigger_level_v / volts_full_scale) * (
             height / 2.0
         )
 
-        trigger_pen = QPen(QColor("#FFB347"))
+        trigger_color = (
+            QColor("#65B7FF") if self.settings.trigger_source == "CH2" else QColor("#FFD84D")
+        )
+        trigger_pen = QPen(trigger_color)
         trigger_pen.setStyle(Qt.PenStyle.DashLine)
         painter.setPen(trigger_pen)
         painter.drawLine(0, int(y), width, int(y))
@@ -262,15 +274,16 @@ class WaveformWidget(QWidget):
         # be displayed at a fixed trigger position.
         level = self.settings.trigger_level_v
         hysteresis = 0.02  # volts
+        min_rise_v = 0.0  # enforce only positive slope
         low = level - (hysteresis * 0.5)
-        high = level + (hysteresis * 0.5)
         left_margin = int(0.2 * visible_count)
         max_crossing = len(samples) - (visible_count - left_margin)
         if max_crossing <= left_margin:
             return max(0, len(samples) - visible_count)
 
         for i in range(max_crossing, left_margin, -1):
-            if samples[i - 1] < low and samples[i] >= high:
+            dv = samples[i] - samples[i - 1]
+            if samples[i - 1] <= low and samples[i] >= level and dv > min_rise_v:
                 self._trigger_found = True
                 return max(0, min(i - left_margin, len(samples) - visible_count))
 
@@ -283,7 +296,7 @@ class WaveformWidget(QWidget):
         visible_seconds = 10.0 * self.settings.s_div
         # Sample rate travels with each frame so display math always matches source.
         sample_rate = self.frame_data.sample_rate_hz if self.frame_data else 1
-        visible_count = int(visible_seconds * sample_rate)
+        visible_count = int(round(visible_seconds * sample_rate))
         visible_count = max(
             2, min(sample_count, visible_count if visible_count > 0 else sample_count)
         )
@@ -572,6 +585,8 @@ class MainWindow(QMainWindow):
             self.settings.ch2_v_div = frame.ch2_v_div
         if frame.s_div is not None:
             self.settings.s_div = frame.s_div
+        if frame.trigger_source is not None:
+            self.settings.trigger_source = frame.trigger_source
         if frame.trigger_level_v is not None:
             self.settings.trigger_level_v = frame.trigger_level_v
         self.waveform.set_settings(self.settings)
