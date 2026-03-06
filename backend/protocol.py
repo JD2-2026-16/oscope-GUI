@@ -40,6 +40,8 @@ FRAME_META_SPAN_MASK = 0x0000FFFF << FRAME_META_SPAN_POS
 
 V_DIV_OPTIONS_V = (0.10, 0.20, 0.50, 1.00, 2.00, 5.00, 10.00)
 S_DIV_OPTIONS_S = (
+    1e-6,
+    2e-6,
     5e-6,
     10e-6,
     20e-6,

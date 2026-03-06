@@ -12,6 +12,9 @@ try:
 except Exception:
     _np = None
 
+ADC_ZERO_CODE = 2142.0
+ADC_CODES_PER_VOLT = 135.0
+
 
 class UsbScope:
     """
@@ -231,7 +234,7 @@ class UsbScope:
             if raw.size < expected:
                 raise RuntimeError("Frame payload truncated")
             raw = raw[:expected].reshape(int(sample_count), 2)
-            volts = (raw.astype(_np.float32) * (3.3 / 4095.0)) - 1.65
+            volts = (raw.astype(_np.float32) - ADC_ZERO_CODE) / ADC_CODES_PER_VOLT
             ch1 = volts[:, 0].tolist()
             ch2 = volts[:, 1].tolist()
         else:
@@ -315,5 +318,5 @@ class UsbScope:
 
     @staticmethod
     def _adc_to_volts(code: int) -> float:
-        # Convert 12-bit ADC code to bipolar volts centered around midscale.
-        return ((float(code) / 4095.0) * 3.3) - 1.65
+        # Calibrated transfer: ADC code = (135 * V) + 2142  ->  V = (code - 2142) / 135.
+        return (float(code) - ADC_ZERO_CODE) / ADC_CODES_PER_VOLT

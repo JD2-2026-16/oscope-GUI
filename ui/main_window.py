@@ -22,6 +22,9 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+HORIZONTAL_DIVISIONS = 10
+VERTICAL_DIVISIONS = 8
+
 
 @dataclass(slots=True)
 class ScopeSettings:
@@ -148,12 +151,14 @@ class WaveformWidget(QWidget):
         grid_pen = QPen(QColor("#1D2633"))
         painter.setPen(grid_pen)
 
-        x_step = max(width // 10, 1)
-        y_step = max(height // 8, 1)
+        x_step = width / float(HORIZONTAL_DIVISIONS)
+        y_step = height / float(VERTICAL_DIVISIONS)
 
-        for x in range(0, width, x_step):
+        for i in range(HORIZONTAL_DIVISIONS + 1):
+            x = int(round(i * x_step))
             painter.drawLine(x, 0, x, height)
-        for y in range(0, height, y_step):
+        for i in range(VERTICAL_DIVISIONS + 1):
+            y = int(round(i * y_step))
             painter.drawLine(0, y, width, y)
 
     def _draw_cached_background(
@@ -178,10 +183,8 @@ class WaveformWidget(QWidget):
             if self.settings.trigger_source == "CH2"
             else self.settings.ch1_v_div
         )
-        volts_full_scale = max(v_div * 4.0, 1e-6)  # +/-4 divisions around center.
-        y = height / 2.0 - (self.settings.trigger_level_v / volts_full_scale) * (
-            height / 2.0
-        )
+        pixels_per_div = height / float(VERTICAL_DIVISIONS)
+        y = (height / 2.0) - (self.settings.trigger_level_v / max(v_div, 1e-6)) * pixels_per_div
 
         trigger_color = (
             QColor("#65B7FF") if self.settings.trigger_source == "CH2" else QColor("#FFD84D")
@@ -213,22 +216,55 @@ class WaveformWidget(QWidget):
             )
         else:
             window_start = forced_window_start
-        # Slice the frame down to exactly what is visible on the screen.
-        window = samples[window_start : window_start + visible_count]
-        if len(window) < 2:
-            return
 
-        # Draw at most ~2 points per screen pixel to keep painting cost bounded.
+        # For very fast time/div, firmware may upsample into a fixed 512-point
+        # packet. Reconstruct the intended low-sample view by sampling across
+        # the full packet instead of taking a short contiguous slice.
+        if visible_count < len(samples):
+            last = len(samples) - 1
+            if visible_count < 2 or last < 1:
+                return
+            window = []
+            for i in range(visible_count):
+                pos = (float(i) * float(last)) / float(visible_count - 1)
+                idx = int(pos)
+                frac = pos - float(idx)
+                nxt = idx + 1 if (idx + 1) <= last else last
+                v = samples[idx] * (1.0 - frac) + samples[nxt] * frac
+                window.append(v)
+        else:
+            # Slice the frame down to exactly what is visible on the screen.
+            window = samples[window_start : window_start + visible_count]
+            if len(window) < 2:
+                return
+
+        # Render a fixed-cost point set:
+        # - downsample when there are too many points,
+        # - linearly interpolate when there are too few points (smooths
+        #   low-sample timebases instead of a stair-step look).
         max_points = max(width * 2, 256)
-        if len(window) > max_points:
-            step = (len(window) + max_points - 1) // max_points
-            downsampled = window[::step]
-            if downsampled[-1] != window[-1]:
-                downsampled.append(window[-1])
-            window = downsampled
+        render_count = min(max_points, 2048)
+        if len(window) > render_count:
+            step = (len(window) + render_count - 1) // render_count
+            reduced = window[::step]
+            if reduced[-1] != window[-1]:
+                reduced.append(window[-1])
+            window = reduced
+        elif len(window) < render_count:
+            last = len(window) - 1
+            if last > 0:
+                interpolated: list[float] = []
+                for i in range(render_count):
+                    pos = (float(i) * float(last)) / float(render_count - 1)
+                    idx = int(pos)
+                    frac = pos - float(idx)
+                    nxt = idx + 1 if (idx + 1) <= last else last
+                    v = window[idx] * (1.0 - frac) + window[nxt] * frac
+                    interpolated.append(v)
+                window = interpolated
 
         # Map volts to vertical pixels using 8 vertical divisions (+/-4 around center).
-        volts_full_scale = max(v_div * 4.0, 1e-6)  # +/-4 divisions on vertical.
+        pixels_per_div = height / float(VERTICAL_DIVISIONS)
         x_scale = width / max(len(window) - 1, 1)
 
         pen = QPen(color)
@@ -239,7 +275,7 @@ class WaveformWidget(QWidget):
         for i, volts in enumerate(window):
             x = float(i) * x_scale
             # Screen Y axis is inverted: larger voltage means lower pixel y value.
-            y = (height / 2.0) - (volts / volts_full_scale) * (height / 2.0)
+            y = (height / 2.0) - (volts / max(v_div, 1e-6)) * pixels_per_div
             points.append(QPointF(x, y))
         painter.drawPolyline(points)
 
@@ -304,6 +340,11 @@ class WaveformWidget(QWidget):
 
     @staticmethod
     def _format_time_div(seconds_per_div: float) -> str:
+        ns = seconds_per_div * 1e9
+        if ns < 1000.0:
+            if abs(ns - round(ns)) < 1e-9:
+                return f"{int(round(ns))} ns/div"
+            return f"{ns:.1f} ns/div"
         us = seconds_per_div * 1e6
         if us >= 1000.0:
             ms = us / 1000.0
@@ -464,9 +505,26 @@ class MainWindow(QMainWindow):
         grid.addWidget(QLabel("S/div"), 2, 0)
         self.sdiv_combo = QComboBox()
         self.sdiv_combo.addItems(
-            ["50 us", "100 us", "200 us", "500 us", "1 ms", "2 ms", "5 ms", "10 ms"]
+            [
+                "1 us",
+                "2 us",
+                "5 us",
+                "10 us",
+                "20 us",
+                "50 us",
+                "100 us",
+                "200 us",
+                "500 us",
+                "1 ms",
+                "2 ms",
+                "5 ms",
+                "10 ms",
+                "20 ms",
+                "50 ms",
+                "100 ms",
+            ]
         )
-        self.sdiv_combo.setCurrentText("200 us")
+        self.sdiv_combo.setCurrentText("20 us")
         self.sdiv_combo.currentTextChanged.connect(self._sync_settings_from_controls)
         grid.addWidget(self.sdiv_combo, 2, 1)
 
@@ -596,6 +654,8 @@ class MainWindow(QMainWindow):
         # Control text is kept human-readable; convert it to seconds/div.
         value_text, unit = text.split()
         value = float(value_text)
+        if unit == "ns":
+            return value * 1e-9
         if unit == "us":
             return value * 1e-6
         if unit == "ms":
