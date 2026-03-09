@@ -6,8 +6,7 @@ from typing import Optional
 from backend.mock_scope import MockScope
 from backend.scope_source import ScopeFrame, ScopeSource
 from backend.usb_scope import UsbScope
-from PyQt6.QtCore import QPointF, Qt, QTimer
-from PyQt6.QtGui import QColor, QPainter, QPaintEvent, QPen, QPixmap
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
     QComboBox,
     QFrame,
@@ -22,8 +21,23 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+try:
+    import fastplotlib as fpl
+except ImportError:  # pragma: no cover - optional dependency at runtime
+    fpl = None
+
+try:
+    import numpy as np
+except ImportError:  # pragma: no cover - optional dependency at runtime
+    np = None
+
 HORIZONTAL_DIVISIONS = 10
-VERTICAL_DIVISIONS = 8
+VERTICAL_DIVISIONS = 10
+X_AXIS_MIN = -HORIZONTAL_DIVISIONS / 2.0
+X_AXIS_MAX = HORIZONTAL_DIVISIONS / 2.0
+Y_AXIS_CENTER = 5.0
+Y_AXIS_MIN = Y_AXIS_CENTER - (VERTICAL_DIVISIONS / 2.0)
+Y_AXIS_MAX = Y_AXIS_CENTER + (VERTICAL_DIVISIONS / 2.0)
 
 
 @dataclass(slots=True)
@@ -46,61 +60,169 @@ class ScopeSettings:
 
 class WaveformWidget(QWidget):
     """
-    Custom plot area.
+    Scope display hosted inside a fastplotlib figure.
 
-    This widget only knows how to draw a frame + settings. It does not talk to
-    USB, timers, or controls directly, which keeps responsibilities clear.
+    The widget still owns oscilloscope-specific view logic such as trigger
+    anchoring and timebase windowing, but delegates the actual drawing to the
+    GPU-backed plotting canvas.
     """
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        # Plot area should expand with the window and stay readable at small sizes.
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMinimumHeight(360)
-        # Last complete frame received from acquisition backend (USB or mock).
         self.frame_data: ScopeFrame | None = None
-        # Snapshot of UI/front-panel settings used for rendering.
         self.settings = ScopeSettings()
-        # Cache static background (solid fill + grid) to avoid redrawing it every frame.
-        self._bg_cache: QPixmap | None = None
-        self._bg_cache_size: tuple[int, int] | None = None
-        # Latched status displayed in the overlay text.
         self._trigger_found: bool = False
+        self._trigger_window_start: int | None = None
+        self._backend_available = fpl is not None and np is not None
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self.readout_label = QLabel()
+        self.readout_label.setStyleSheet(
+            "color: #7F8FA6; background: rgba(16, 19, 26, 190);"
+            "padding: 5px 8px; border: 1px solid rgba(29, 38, 51, 180); border-radius: 4px;"
+        )
+        self.readout_label.setParent(self)
+        self.readout_label.raise_()
+
+        self.notice_label = QLabel()
+        self.notice_label.setStyleSheet(
+            "color: #7F8FA6; background: rgba(16, 19, 26, 190);"
+            "padding: 5px 8px; border: 1px solid rgba(29, 38, 51, 180); border-radius: 4px;"
+        )
+        self.notice_label.setParent(self)
+        self.notice_label.raise_()
+
+        self.figure = None
+        self.subplot = None
+        self._plot_widget = None
+        self._bounds_line = None
+        self._trigger_line = None
+        self._ch1_line = None
+        self._ch2_line = None
+
+        if self._backend_available:
+            self._init_fastplotlib_canvas(layout)
+        else:
+            self.notice_label.setText(
+                "Install `fastplotlib` and `numpy` to enable waveform rendering."
+            )
+
+        self._update_readout()
+
+    def _init_fastplotlib_canvas(self, layout: QVBoxLayout) -> None:
+        assert fpl is not None
+        assert np is not None
+
+        self.figure = fpl.Figure()
+        self.subplot = self.figure[0, 0]
+        self.subplot.name = None
+        self.subplot.title = ""
+        self.subplot.camera.maintain_aspect = False
+        self.subplot.background_color = ((0.062, 0.074, 0.102, 1.0),) * 4
+        self.subplot.axes.grids.xy.visible = True
+        self.subplot.axes.auto_grid = False
+        self.subplot.axes.grids.xy.major_step = (1, 1)
+        self.subplot.axes.grids.xy.minor_step = (0, 0)
+        self.subplot.axes.grids.xy.major_thickness = 0.6
+        self.subplot.axes.grids.xy.axis_thickness = 0.35
+        self.subplot.axes.grids.xy.major_color = "#18202C"
+        self.subplot.axes.grids.xy.axis_color = "#18202C"
+        self.subplot.axes.x.visible = False
+        self.subplot.axes.y.visible = False
+        self.subplot.axes.z.visible = False
+
+        bounds = np.asarray(
+            [
+                [X_AXIS_MIN, Y_AXIS_MIN, 0.0],
+                [X_AXIS_MAX, Y_AXIS_MAX, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        baseline = self._make_division_line([0.0, 0.0], [-40.0, -40.0])
+        trigger = self._make_division_line([0.0, 0.0], [0.0, 0.0])
+
+        self._bounds_line = self.subplot.add_line(
+            data=bounds,
+            colors=(0.0, 0.0, 0.0, 0.0),
+            thickness=1.0,
+            name="bounds",
+        )
+        self._trigger_line = self.subplot.add_line(
+            data=trigger,
+            colors="white",
+            thickness=0.9,
+            name="trigger",
+        )
+        self._ch1_line = self.subplot.add_line(
+            data=baseline,
+            colors="#FFD84D",
+            thickness=1.4,
+            name="ch1",
+        )
+        self._ch2_line = self.subplot.add_line(
+            data=baseline,
+            colors="#65B7FF",
+            thickness=1.4,
+            name="ch2",
+        )
+
+        self._plot_widget = self.figure.show(
+            autoscale=False,
+            maintain_aspect=False,
+            axes_visible=True,
+        )
+        self._plot_widget.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        layout.addWidget(self._plot_widget, stretch=1)
+        self._plot_widget.lower()
+        self.subplot.controller.enabled = False
+        self._apply_default_view()
+        self._reposition_overlays()
+
+    @staticmethod
+    def _make_division_line(xs: list[float], ys: list[float]) -> "np.ndarray":
+        assert np is not None
+        return np.column_stack(
+            [
+                np.asarray(xs, dtype=np.float32),
+                np.asarray(ys, dtype=np.float32),
+                np.zeros(len(xs), dtype=np.float32),
+            ]
+        )
 
     def set_frame(self, frame: ScopeFrame) -> None:
-        """Push in latest frame and request repaint."""
         self.frame_data = frame
-        self.update()
+        self._refresh_plot()
 
     def set_settings(self, settings: ScopeSettings) -> None:
-        """Push updated knob/button values and repaint."""
         self.settings = settings
-        self.update()
+        self._refresh_plot()
 
-    def paintEvent(self, event: QPaintEvent) -> None:  # noqa: N802
-        del event
-        painter = QPainter(self)
-        # Keep redraw latency low; anti-aliasing is expensive at high refresh rates.
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+    def _refresh_plot(self) -> None:
+        self._update_readout()
+        self._update_trigger_line()
 
-        rect = self.rect()
-        # Draw static layers first, then dynamic overlays/waveforms.
-        self._draw_cached_background(painter, rect.width(), rect.height())
-
-        # Draw trigger level even before data exists so control feedback is visible.
-        self._draw_trigger_line(painter, rect.width(), rect.height())
-
-        if self.frame_data is None or self.frame_data.sample_count < 2:
-            painter.setPen(QColor("#7F8FA6"))
-            painter.drawText(14, 20, "No frame yet. Click Connect, then Run.")
+        if not self._backend_available or self.frame_data is None:
+            self._update_notice()
+            return
+        if self.frame_data.sample_count < 2:
+            self._set_channel_visible(self._ch1_line, False)
+            self._set_channel_visible(self._ch2_line, False)
+            self._update_notice()
             return
 
-        # Compute one shared visible sample window so CH1/CH2 stay time-aligned.
         visible_count = self._compute_visible_count(self.frame_data.sample_count)
         if self.frame_data.trigger_found is not None:
             self._trigger_found = bool(self.frame_data.trigger_found)
         else:
             self._trigger_found = False
+
         trigger_samples = (
             self.frame_data.ch2
             if self.settings.trigger_source == "CH2"
@@ -110,173 +232,204 @@ class WaveformWidget(QWidget):
             trigger_samples, visible_count, self.settings.trigger_source
         )
 
-        if self.settings.ch1_enabled:
-            self._draw_channel(
-                painter=painter,
-                samples=self.frame_data.ch1,
-                width=rect.width(),
-                height=rect.height(),
-                v_div=self.settings.ch1_v_div,
-                color=QColor("#FFD84D"),
-                source_name="CH1",
-                forced_window_start=shared_window_start,
-            )
-        if self.settings.ch2_enabled:
-            self._draw_channel(
-                painter=painter,
-                samples=self.frame_data.ch2,
-                width=rect.width(),
-                height=rect.height(),
-                v_div=self.settings.ch2_v_div,
-                color=QColor("#65B7FF"),
-                source_name="CH2",
-                forced_window_start=shared_window_start,
-            )
+        self._ch1_line = self._update_channel_graphic(
+            graphic=self._ch1_line,
+            samples=self.frame_data.ch1,
+            v_div=self.settings.ch1_v_div,
+            source_name="CH1",
+            enabled=self.settings.ch1_enabled,
+            forced_window_start=shared_window_start,
+            color="#FFD84D",
+            name="ch1",
+        )
+        self._ch2_line = self._update_channel_graphic(
+            graphic=self._ch2_line,
+            samples=self.frame_data.ch2,
+            v_div=self.settings.ch2_v_div,
+            source_name="CH2",
+            enabled=self.settings.ch2_enabled,
+            forced_window_start=shared_window_start,
+            color="#65B7FF",
+            name="ch2",
+        )
+        self._update_notice()
 
-        painter.setPen(QColor("#7F8FA6"))
-        painter.drawText(
-            14,
-            20,
+    def _update_notice(self) -> None:
+        if not self._backend_available:
+            self.notice_label.show()
+            return
+        if self.frame_data is None or self.frame_data.sample_count < 2:
+            self.notice_label.setText("No frame yet. Click Connect, then Run.")
+            self.notice_label.adjustSize()
+            self.notice_label.show()
+            self._reposition_overlays()
+            return
+        if self._trigger_found:
+            self.notice_label.hide()
+            return
+        self.notice_label.setText("Trigger not found in current frame.")
+        self.notice_label.adjustSize()
+        self.notice_label.show()
+        self._reposition_overlays()
+
+    def _update_readout(self) -> None:
+        self.readout_label.setText(
             (
                 f"CH1 {self.settings.ch1_v_div:.2f} V/div   "
                 f"CH2 {self.settings.ch2_v_div:.2f} V/div   "
                 f"{self._format_time_div(self.settings.s_div)}   "
                 f"Trig {self.settings.trigger_source} {self.settings.trigger_level_v:+.2f} V"
-            ),
+            )
         )
+        self.readout_label.adjustSize()
+        self.readout_label.show()
+        self._reposition_overlays()
 
-    def _draw_grid(self, painter: QPainter, width: int, height: int) -> None:
-        # Scope style grid: 10 horizontal divisions, 8 vertical divisions.
-        grid_pen = QPen(QColor("#1D2633"))
-        painter.setPen(grid_pen)
+    def _update_trigger_line(self) -> None:
+        if not self._backend_available or self._trigger_line is None:
+            return
 
-        x_step = width / float(HORIZONTAL_DIVISIONS)
-        y_step = height / float(VERTICAL_DIVISIONS)
-
-        for i in range(HORIZONTAL_DIVISIONS + 1):
-            x = int(round(i * x_step))
-            painter.drawLine(x, 0, x, height)
-        for i in range(VERTICAL_DIVISIONS + 1):
-            y = int(round(i * y_step))
-            painter.drawLine(0, y, width, y)
-
-    def _draw_cached_background(
-        self, painter: QPainter, width: int, height: int
-    ) -> None:
-        # Rebuild cached pixmap only when the widget size changes.
-        size = (width, height)
-        if self._bg_cache is None or self._bg_cache_size != size:
-            bg = QPixmap(width, height)
-            bg.fill(QColor("#10131A"))
-            bg_painter = QPainter(bg)
-            self._draw_grid(bg_painter, width, height)
-            bg_painter.end()
-            self._bg_cache = bg
-            self._bg_cache_size = size
-        painter.drawPixmap(0, 0, self._bg_cache)
-
-    def _draw_trigger_line(self, painter: QPainter, width: int, height: int) -> None:
-        # Scale trigger line against the active trigger source channel.
         v_div = (
             self.settings.ch2_v_div
             if self.settings.trigger_source == "CH2"
             else self.settings.ch1_v_div
         )
-        pixels_per_div = height / float(VERTICAL_DIVISIONS)
-        y = (height / 2.0) - (self.settings.trigger_level_v / max(v_div, 1e-6)) * pixels_per_div
-
-        trigger_color = (
-            QColor("#65B7FF") if self.settings.trigger_source == "CH2" else QColor("#FFD84D")
+        y_divisions = self.settings.trigger_level_v / max(v_div, 1e-6)
+        self._trigger_line.data = self._make_division_line(
+            [X_AXIS_MIN, X_AXIS_MAX],
+            [Y_AXIS_CENTER + y_divisions, Y_AXIS_CENTER + y_divisions],
         )
-        trigger_pen = QPen(trigger_color)
-        trigger_pen.setStyle(Qt.PenStyle.DashLine)
-        painter.setPen(trigger_pen)
-        painter.drawLine(0, int(y), width, int(y))
+        self._trigger_line.colors = (
+            "#65B7FF" if self.settings.trigger_source == "CH2" else "#FFD84D"
+        )
 
-    def _draw_channel(
+    @staticmethod
+    def _set_channel_visible(graphic: object, visible: bool) -> None:
+        if graphic is not None:
+            graphic.visible = visible
+
+    def _update_channel_graphic(
         self,
-        painter: QPainter,
+        graphic: object,
         samples: list[float],
-        width: int,
-        height: int,
         v_div: float,
-        color: QColor,
+        source_name: str,
+        enabled: bool,
+        forced_window_start: int | None = None,
+        color: str = "white",
+        name: str | None = None,
+    ) -> object:
+        if graphic is None:
+            return graphic
+
+        graphic.visible = enabled
+        if not enabled:
+            return graphic
+
+        points = self._build_channel_points(
+            samples=samples,
+            v_div=v_div,
+            source_name=source_name,
+            forced_window_start=forced_window_start,
+        )
+        if points is None:
+            graphic.visible = False
+            return graphic
+
+        current_shape = getattr(getattr(graphic, "data", None), "value", None)
+        if current_shape is not None:
+            current_shape = current_shape.shape
+
+        if current_shape != points.shape:
+            assert self.subplot is not None
+            self.subplot.delete_graphic(graphic)
+            graphic = self.subplot.add_line(
+                data=points,
+                colors=color,
+                thickness=1.4,
+                name=name,
+            )
+            graphic.visible = enabled
+            return graphic
+
+        graphic.data = points
+        return graphic
+
+    def _build_channel_points(
+        self,
+        samples: list[float],
+        v_div: float,
         source_name: str,
         forced_window_start: int | None = None,
-    ) -> None:
-        # Convert current time/div setting into how many samples to display.
-        visible_count = self._compute_visible_count(len(samples))
+    ) -> "np.ndarray | None":
+        assert np is not None
 
-        # Trigger alignment: try to start window near a threshold crossing so each
-        # repaint is stable and looks like a scope instead of random drift.
+        visible_count = self._compute_visible_count(len(samples))
         if forced_window_start is None:
-            window_start = self._choose_window_start(
-                samples, visible_count, source_name
-            )
+            window_start = self._choose_window_start(samples, visible_count, source_name)
         else:
             window_start = forced_window_start
 
-        # For very fast time/div, firmware may upsample into a fixed 512-point
-        # packet. Reconstruct the intended low-sample view by sampling across
-        # the full packet instead of taking a short contiguous slice.
         if visible_count < len(samples):
             last = len(samples) - 1
             if visible_count < 2 or last < 1:
-                return
-            window = []
-            for i in range(visible_count):
-                pos = (float(i) * float(last)) / float(visible_count - 1)
-                idx = int(pos)
-                frac = pos - float(idx)
-                nxt = idx + 1 if (idx + 1) <= last else last
-                v = samples[idx] * (1.0 - frac) + samples[nxt] * frac
-                window.append(v)
+                return None
+            positions = np.linspace(0.0, float(last), visible_count, dtype=np.float32)
+            base = np.arange(len(samples), dtype=np.float32)
+            window = np.interp(
+                positions,
+                base,
+                np.asarray(samples, dtype=np.float32),
+            )
         else:
-            # Slice the frame down to exactly what is visible on the screen.
-            window = samples[window_start : window_start + visible_count]
-            if len(window) < 2:
-                return
+            window = np.asarray(
+                samples[window_start : window_start + visible_count],
+                dtype=np.float32,
+            )
+            if window.size < 2:
+                return None
 
-        # Render a fixed-cost point set:
-        # - downsample when there are too many points,
-        # - linearly interpolate when there are too few points (smooths
-        #   low-sample timebases instead of a stair-step look).
-        max_points = max(width * 2, 256)
-        render_count = min(max_points, 2048)
-        if len(window) > render_count:
-            step = (len(window) + render_count - 1) // render_count
-            reduced = window[::step]
-            if reduced[-1] != window[-1]:
-                reduced.append(window[-1])
-            window = reduced
-        elif len(window) < render_count:
-            last = len(window) - 1
-            if last > 0:
-                interpolated: list[float] = []
-                for i in range(render_count):
-                    pos = (float(i) * float(last)) / float(render_count - 1)
-                    idx = int(pos)
-                    frac = pos - float(idx)
-                    nxt = idx + 1 if (idx + 1) <= last else last
-                    v = window[idx] * (1.0 - frac) + window[nxt] * frac
-                    interpolated.append(v)
-                window = interpolated
+        render_count = min(max(window.size, 256), 2048)
+        if window.size > render_count:
+            sample_idx = np.linspace(
+                0.0, float(window.size - 1), render_count, dtype=np.float32
+            )
+            window = np.interp(sample_idx, np.arange(window.size, dtype=np.float32), window)
+        elif window.size < render_count:
+            sample_idx = np.linspace(
+                0.0, float(window.size - 1), render_count, dtype=np.float32
+            )
+            window = np.interp(sample_idx, np.arange(window.size, dtype=np.float32), window)
 
-        # Map volts to vertical pixels using 8 vertical divisions (+/-4 around center).
-        pixels_per_div = height / float(VERTICAL_DIVISIONS)
-        x_scale = width / max(len(window) - 1, 1)
+        x = np.linspace(X_AXIS_MIN, X_AXIS_MAX, window.size, dtype=np.float32)
+        y = Y_AXIS_CENTER + (window / max(v_div, 1e-6))
+        return np.column_stack(
+            [x, y.astype(np.float32), np.zeros(window.size, dtype=np.float32)]
+        )
 
-        pen = QPen(color)
-        pen.setWidth(2)
-        painter.setPen(pen)
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._reposition_overlays()
 
-        points: list[QPointF] = []
-        for i, volts in enumerate(window):
-            x = float(i) * x_scale
-            # Screen Y axis is inverted: larger voltage means lower pixel y value.
-            y = (height / 2.0) - (volts / max(v_div, 1e-6)) * pixels_per_div
-            points.append(QPointF(x, y))
-        painter.drawPolyline(points)
+    def _reposition_overlays(self) -> None:
+        margin = 10
+        self.readout_label.move(margin, margin)
+        if self.notice_label.isVisible():
+            y = self.readout_label.y() + self.readout_label.height() + 6
+            self.notice_label.move(margin, y)
+
+    def _apply_default_view(self) -> None:
+        if self.subplot is None:
+            return
+
+        self.subplot.camera.width = HORIZONTAL_DIVISIONS
+        self.subplot.camera.height = VERTICAL_DIVISIONS
+        self.subplot.camera.zoom = 1.0
+        self.subplot.camera.local.position = (
+            (X_AXIS_MIN + X_AXIS_MAX) / 2.0,
+            Y_AXIS_CENTER,
+            0.0,
+        )
 
     def _choose_window_start(
         self, samples: list[float], visible_count: int, source_name: str
@@ -290,20 +443,33 @@ class WaveformWidget(QWidget):
         if self.frame_data and self.frame_data.trigger_found is not None:
             if not self.frame_data.trigger_found:
                 self._trigger_found = False
+                self._trigger_window_start = None
                 return max(0, len(samples) - visible_count)
             if self.frame_data.trigger_index is None:
                 self._trigger_found = False
+                self._trigger_window_start = None
                 return max(0, len(samples) - visible_count)
             # Place trigger around 20% from left, similar to many scopes.
             left_margin = int(0.2 * visible_count)
             self._trigger_found = True
-            return max(
+            candidate = max(
                 0,
                 min(
                     int(self.frame_data.trigger_index) - left_margin,
                     len(samples) - visible_count,
                 ),
             )
+            if self._trigger_window_start is not None:
+                delta = candidate - self._trigger_window_start
+                abs_delta = abs(delta)
+                # Suppress sub-sample/index chatter around a stable edge.
+                if abs_delta <= 2:
+                    candidate = self._trigger_window_start
+                # Damp medium jumps to reduce visible jitter.
+                elif abs_delta <= 24:
+                    candidate = self._trigger_window_start + (delta // 2)
+            self._trigger_window_start = candidate
+            return candidate
 
         # Fallback trigger detection: choose the newest rising crossing that can
         # be displayed at a fixed trigger position.
@@ -323,6 +489,7 @@ class WaveformWidget(QWidget):
                 return max(0, min(i - left_margin, len(samples) - visible_count))
 
         self._trigger_found = False
+        self._trigger_window_start = None
         return max(0, len(samples) - visible_count)
 
     def _compute_visible_count(self, sample_count: int) -> int:
@@ -436,7 +603,7 @@ class MainWindow(QMainWindow):
         middle.addWidget(self.waveform, stretch=1)
 
         footer = QLabel(
-            "Viewer mode: waveform display follows front-panel settings from scope firmware."
+            "Viewer mode: fastplotlib renders the scope display while firmware settings still drive the view."
         )
         layout.addWidget(footer)
 
