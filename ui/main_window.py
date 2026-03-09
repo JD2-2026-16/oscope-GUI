@@ -141,8 +141,7 @@ class WaveformWidget(QWidget):
                 f"CH1 {self.settings.ch1_v_div:.2f} V/div   "
                 f"CH2 {self.settings.ch2_v_div:.2f} V/div   "
                 f"{self._format_time_div(self.settings.s_div)}   "
-                f"Trig {self.settings.trigger_source} {self.settings.trigger_level_v:+.2f} V   "
-                f"Trigger: {'FOUND' if self._trigger_found else 'NOT FOUND'}"
+                f"Trig {self.settings.trigger_source} {self.settings.trigger_level_v:+.2f} V"
             ),
         )
 

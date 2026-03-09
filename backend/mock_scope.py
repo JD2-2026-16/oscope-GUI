@@ -13,7 +13,7 @@ class MockScope:
     one frame at a time, with both channels sampled simultaneously.
     """
 
-    def __init__(self, sample_rate_hz: int = 250_000, frame_samples: int = 4096) -> None:
+    def __init__(self, sample_rate_hz: int = 500000, frame_samples: int = 512) -> None:
         self.sample_rate_hz = sample_rate_hz
         self.frame_samples = frame_samples
         self._connected = False
@@ -36,9 +36,9 @@ class MockScope:
         # Synthetic signal setup:
         # - CH1 is cleaner and lower-frequency.
         # - CH2 is a mix of tones to imitate a noisier channel.
-        f1 = 12_500.0
-        f2 = 31_000.0
-        f2b = 4_500.0
+        f1 = 10_000.0
+        f2 = 12_000.0
+        f2b = 3_500.0
 
         step1 = 2.0 * math.pi * f1 / self.sample_rate_hz
         step2 = 2.0 * math.pi * f2 / self.sample_rate_hz
@@ -48,7 +48,9 @@ class MockScope:
         for _ in range(self.frame_samples):
             # Volt units are arbitrary here; GUI scaling uses V/div controls.
             v1 = 1.1 * math.sin(self._phase1) + 0.08 * math.sin(self._phase1 * 6.0)
-            v2 = 0.65 * math.sin(self._phase2) + 0.35 * math.sin(self._phase2 * (f2b / f2))
+            v2 = 0.65 * math.sin(self._phase2) + 0.35 * math.sin(
+                self._phase2 * (f2b / f2)
+            )
 
             ch1.append(v1)
             ch2.append(v2)
@@ -62,4 +64,6 @@ class MockScope:
 
         # Trigger index is optional metadata from backend/firmware.
         # For mock mode we leave it None and let UI find a crossing itself.
-        return ScopeFrame(sample_rate_hz=self.sample_rate_hz, ch1=ch1, ch2=ch2, trigger_index=None)
+        return ScopeFrame(
+            sample_rate_hz=self.sample_rate_hz, ch1=ch1, ch2=ch2, trigger_index=None
+        )
